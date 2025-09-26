@@ -26,4 +26,4 @@ Before running the model, the downloaded data needs to be preprocessed. Please r
 
 ### 3\. Run the Code
 
-Once the data is ready, you can directly run the `run.ipynb` file in the project's root directory to train and evaluate the STevs model. This file contains the complete workflow for model training, evaluation, and visualization.
+Once the data is ready, you can directly run the `run.ipynb` file in the project's root directory to train and evaluate the STevs model. This file contains the workflow for model training, evaluation, and visualization.
