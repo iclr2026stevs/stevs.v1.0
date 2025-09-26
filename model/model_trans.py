@@ -265,7 +265,8 @@ class MultiModalVAE(nn.Module):
         mu_rna = self.rna_decoder_mu(rna_base)
         theta_rna = self.rna_decoder_theta(rna_base)
         reconstructed_rna_params = {"mu": mu_rna, "theta": theta_rna}
-
+        mu_img = self.reparameterize(mu_img, log_var_img)
+        mu_spatial = self.reparameterize(mu_spatial, log_var_spatial)
         return (reconstructed_image, reconstructed_rna_params,
                 mu_fused, log_var_fused,
                 mu_img, mu_spatial)
