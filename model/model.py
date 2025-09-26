@@ -10,19 +10,18 @@ from scipy.stats import spearmanr
 from scipy.stats import pearsonr
 from typing import Literal
 
-# --- 依赖库 (timm是新增的) ---
 from timm.models.vision_transformer import VisionTransformer
-import timm # *** NEW ***
+import timm
 from timm.layers import DropPath
 
-from safetensors.torch import load_file # *** NEW: 导入safetensors的加载函数 ***
+from safetensors.torch import load_file # *** NEW: import safetensors load function ***
 import warnings
 from scipy.stats import ConstantInputWarning
 
-# 将 ConstantInputWarning 警告设置为忽略
+# Ignore ConstantInputWarning
 warnings.filterwarnings("ignore", category=ConstantInputWarning)
 
-local_weights_path = './model.safetensors' 
+local_weights_path = './model.safetensors'
 
 import torch
 from torch import nn
@@ -30,23 +29,23 @@ import numpy as np
 
 class FourierFeatureMapping(nn.Module):
     """
-    将低维输入坐标映射到高维傅里叶特征空间。
+    Maps low-dimensional input coordinates to a high-dimensional Fourier feature space.
     """
     def __init__(self, input_dim: int, embedding_dim: int, scale: float = 1.0):
         """
         Args:
-            input_dim (int): 输入维度，例如 2 (x, y)。
-            embedding_dim (int): 输出维度，必须是偶数。
-            scale (float): 傅里叶特征的频率尺度。
+            input_dim (int): Input dimension, e.g., 2 for (x, y).
+            embedding_dim (int): Output dimension, must be an even number.
+            scale (float): Frequency scale of the Fourier features.
         """
         super().__init__()
         if embedding_dim % 2 != 0:
             raise ValueError("embedding_dim must be an even number.")
-        
-        # 创建可学习的傅里叶频率矩阵 B
+
+        # Create a learnable Fourier frequency matrix B
         self.B = nn.Parameter(
             torch.randn(input_dim, embedding_dim // 2) * scale,
-            requires_grad=True # 频率矩阵可学习
+            requires_grad=True # The frequency matrix is learnable
         )
         self.input_dim = input_dim
         self.embedding_dim = embedding_dim
@@ -54,17 +53,17 @@ class FourierFeatureMapping(nn.Module):
     def forward(self, x):
         """
         Args:
-            x (torch.Tensor): 形状为 (batch_size, input_dim) 的输入坐标。
-        
+            x (torch.Tensor): Input coordinates with shape (batch_size, input_dim).
+
         Returns:
-            torch.Tensor: 形状为 (batch_size, embedding_dim) 的傅里叶特征。
+            torch.Tensor: Fourier features with shape (batch_size, embedding_dim).
         """
-        # (x @ self.B) 的形状为 (batch_size, embedding_dim // 2)
-        # 乘以 2π，然后计算 sin 和 cos
+        # (x @ self.B) has shape (batch_size, embedding_dim // 2)
+        # Multiply by 2π and compute sin and cos
         x_proj = 2 * np.pi * x @ self.B
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
-# --- VAE 基础模块 (保持不变) ---
+# --- VAE base modules (unchanged) ---
 class ConvMLP(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super(ConvMLP, self).__init__()
@@ -97,7 +96,7 @@ class ConvBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
-# --- 负二项分布组件 (保持不变) ---
+# --- Negative Binomial distribution components (unchanged) ---
 from torch.distributions import Distribution, constraints
 from torch.distributions.utils import broadcast_all
 def log_nb_positive(x, mu, theta, eps=1e-6):
@@ -127,9 +126,7 @@ def scellst_nll_loss(dist_params, target_rna):
     nb_dist = NegativeBinomial(mu=mu, theta=theta)
     return -nb_dist.log_prob(target_rna).sum() / target_rna.shape[0]
 
-# ======================================================================
-# --- 1. 核心模型: MultiModalVAE (已升级) ---
-# ======================================================================
+
 class MultiModalVAE(nn.Module):
     def __init__(self, input_channels=3, spatial_dim=2, latent_dim=128, img_size=32, rna_dim=2000, fourier_feature_dim=128, hidden_dims=None):
         super(MultiModalVAE, self).__init__()
@@ -137,60 +134,60 @@ class MultiModalVAE(nn.Module):
         self.img_size = img_size
         self.rna_dim = rna_dim
 
-        # --- 编码器 (Encoders) ---
-        
-        # *** MODIFIED: 1.1 图像编码器 (Image Encoder) - 使用 Swin Transformer ***
-        # 加载预训练的、小型的Swin Transformer。
-        # num_classes=0 表示我们只想要特征，而不是分类结果。
+        # --- Encoders ---
+
+        # *** MODIFIED: 1.1 Image Encoder - Using Swin Transformer ***
+        # Load a pretrained, small Swin Transformer.
+        # num_classes=0 means we only want features, not classification results.
         self.image_encoder_swin = timm.create_model(
             'swin_tiny_patch4_window7_224',
-            pretrained=False, # 关键：这里必须是 False，因为我们不联网
+            pretrained=False, # Key: Must be False here because we're not connected to the internet
             num_classes=0,
             img_size=self.img_size,
             in_chans=input_channels
         )
 
-        # 3. 从本地文件加载权重并应用到模型上
-        # *** MODIFIED: 使用 safetensors.torch.load_file 来加载权重 ***
-        # *** MODIFIED: 使用更灵活的方式加载权重，以处理尺寸不匹配的问题 ***
+        # 3. Load weights from local file and apply to the model
+        # *** MODIFIED: Use safetensors.torch.load_file to load weights ***
+        # *** MODIFIED: Use a more flexible way to load weights, to handle size mismatch issues ***
         try:
-            print(f"正在从本地文件加载预训练权重: {local_weights_path}")
-            
-            # 1. 加载预训练权重
+            print(f"Loading pretrained weights from local file: {local_weights_path}")
+
+            # 1. Load pretrained weights
             pretrained_dict = load_file(local_weights_path, device='cpu')
-            
-            # 2. 获取你当前模型的权重字典
+
+            # 2. Get the state dictionary of your current model
             model_dict = self.image_encoder_swin.state_dict()
-            
-            # 3. 过滤预训练权重：
-            #    - 只保留那些在你当前模型中也存在的层（处理 "Unexpected key" 问题）
-            #    - 只保留那些形状完全匹配的层（处理 "size mismatch" 问题）
+
+            # 3. Filter pretrained weights:
+            #    - Only keep layers that also exist in your current model (handles "Unexpected key" issues)
+            #    - Only keep layers with an exact shape match (handles "size mismatch" issues)
             pretrained_dict_filtered = {
-                k: v for k, v in pretrained_dict.items() 
+                k: v for k, v in pretrained_dict.items()
                 if k in model_dict and model_dict[k].shape == v.shape
             }
-            
-            # 4. 用过滤后的权重更新你当前模型的权重字典
+
+            # 4. Update your current model's state dictionary with the filtered weights
             model_dict.update(pretrained_dict_filtered)
-            
-            # 5. 将更新后的权重字典加载回模型
+
+            # 5. Load the updated state dictionary back into the model
             self.image_encoder_swin.load_state_dict(model_dict)
-            
+
             loaded_keys = len(pretrained_dict_filtered)
             total_keys = len(model_dict)
-            print(f"本地权重加载成功！匹配并加载了 {loaded_keys} / {total_keys} 个权重层。")
+            print(f"Local weights loaded successfully! Matched and loaded {loaded_keys} / {total_keys} weight layers.")
 
         except FileNotFoundError:
-            print(f"错误：找不到权重文件 {local_weights_path}！请确保文件已上传到正确的位置。模型将使用随机初始化的权重。")
-        # 获取Swin输出的特征维度
+            print(f"Error: Pretrained weight file {local_weights_path} not found! Please ensure the file is uploaded to the correct location. The model will use randomly initialized weights.")
+        # Get the feature dimension of the Swin output
         swin_output_dim = self.image_encoder_swin.num_features
         self.img_fc_mu = nn.Linear(swin_output_dim, latent_dim)
         self.img_fc_log_var = nn.Linear(swin_output_dim, latent_dim)
         # self.fourier_mapper = FourierFeatureMapping(
-        #     input_dim=spatial_dim, 
-        #     embedding_dim=fourier_feature_dim # 输出维度为128
+        #     input_dim=spatial_dim,
+        #     embedding_dim=fourier_feature_dim # Output dimension is 128
         # )
-        # 1.2 空间位置编码器 (Spatial Encoder) - 保持不变
+        # 1.2 Spatial Position Encoder (unchanged)
         self.spatial_encoder = nn.Sequential(
             nn.Linear(spatial_dim, 64), nn.ReLU(),
             nn.Linear(64, 128), nn.ReLU()
@@ -198,19 +195,19 @@ class MultiModalVAE(nn.Module):
         self.spatial_fc_mu = nn.Linear(128, latent_dim)
         self.spatial_fc_log_var = nn.Linear(128, latent_dim)
 
-        # --- 解码器 (Decoders) ---
-        
-        # *** MODIFIED: 2.1 图像解码器 (Image Decoder) - 适配 Swin Encoder 输出 ***
-        # 为了让解码器工作，我们需要定义一个解码器开始时的“特征图”形状
+        # --- Decoders ---
+
+        # *** MODIFIED: 2.1 Image Decoder - Adapting to Swin Encoder output ***
+        # To make the decoder work, we need to define the "feature map" shape at the beginning of the decoder
         self.decoder_start_channels = 256
-        self.decoder_start_size = img_size // 8 # 例如，从 32x32 -> 4x4 开始
+        self.decoder_start_size = img_size // 8 # e.g., starting from 32x32 -> 4x4
         decoder_input_size = self.decoder_start_channels * (self.decoder_start_size ** 2)
-        
+
         self.img_decoder_input = nn.Linear(latent_dim, decoder_input_size)
-        
+
         if hidden_dims is None:
-            hidden_dims = [32, 64, 128, 256] # 保留用于解码器结构
-        
+            hidden_dims = [32, 64, 128, 256] # Retain for decoder structure
+
         img_decoder_dims = hidden_dims[::-1] # [256, 128, 64, 32]
         self.img_decoder_stages = nn.ModuleList()
         for i in range(len(img_decoder_dims) - 1):
@@ -226,7 +223,7 @@ class MultiModalVAE(nn.Module):
             nn.Tanh()
         )
 
-        # *** MODIFIED: 2.2 RNA 解码器 (RNA Decoder) - 增强版 ***
+        # *** MODIFIED: 2.2 RNA Decoder - Enhanced Version ***
         self.rna_decoder_base = nn.Sequential(
             nn.Linear(latent_dim, 256),
             nn.BatchNorm1d(256),
@@ -253,38 +250,38 @@ class MultiModalVAE(nn.Module):
         return mu + eps * std
 
     def forward(self, image, spatial):
-        # 1. 编码
-        # 图像编码 (Swin)
+        # 1. Encoding
+        # Image encoding (Swin)
         img_x = self.image_encoder_swin(image).detach()
         mu_img = self.img_fc_mu(img_x)
         log_var_img = self.img_fc_log_var(img_x)
-        
-        # 空间编码 (MLP)
+
+        # Spatial encoding (MLP)
         # spatial_fourier = self.fourier_mapper(spatial)
         spatial_x = self.spatial_encoder(spatial)
         mu_spatial = self.spatial_fc_mu(spatial_x)
         log_var_spatial = self.spatial_fc_log_var(spatial_x)
-        
-        # 2. 融合潜在空间 (PoE)
+
+        # 2. Fusing latent spaces (PoE)
         mu_fused, log_var_fused = self.fuse_latents(mu_img, log_var_img, mu_spatial, log_var_spatial)
-        
-        # 3. 重参数化
+
+        # 3. Reparameterization
         z = self.reparameterize(mu_fused, log_var_fused)
-        
-        # 4. 解码
-        # 图像解码
+
+        # 4. Decoding
+        # Image decoding
         img_recon_x = self.img_decoder_input(z)
         img_recon_x = img_recon_x.view(-1, self.decoder_start_channels, self.decoder_start_size, self.decoder_start_size)
         for stage in self.img_decoder_stages:
             img_recon_x = stage(img_recon_x)
         reconstructed_image = self.img_final_layer(img_recon_x)
-        
-        # RNA解码
-        # BatchNorm1d 在 batch_size=1 时会报错，需要特殊处理
+
+        # RNA decoding
+        # BatchNorm1d can raise an error with batch_size=1, special handling is needed
         if z.shape[0] > 1:
             rna_base = self.rna_decoder_base(z)
         else:
-            # 临时切换到eval模式以禁用BN和Dropout
+            # Temporarily switch to eval mode to disable BN and Dropout
             original_mode = self.rna_decoder_base.training
             self.rna_decoder_base.eval()
             with torch.no_grad():
@@ -295,83 +292,78 @@ class MultiModalVAE(nn.Module):
         theta_rna = self.rna_decoder_theta(rna_base)
         reconstructed_rna_params = {"mu": mu_rna, "theta": theta_rna}
         z_img, z_spatial = self.reparameterize(mu_img, log_var_img), self.reparameterize(mu_spatial, log_var_spatial)
-        # *** MODIFIED: 返回所有潜在变量用于计算新损失 ***
-        return (reconstructed_image, reconstructed_rna_params, 
-                mu_fused, log_var_fused, 
+        # *** MODIFIED: Return all latent variables for the new loss calculation ***
+        return (reconstructed_image, reconstructed_rna_params,
+                mu_fused, log_var_fused,
                 z_img, z_spatial)
 
     def get_latent_representations(self, image, spatial):
         """
-        输入与 forward 函数相同，但只返回不同层级的潜向量。
-        这对于潜空间的可视化和分析非常有用。
-        
+        Takes the same inputs as the forward pass but only returns the latent vectors from different levels.
+        This is useful for latent space visualization and analysis.
+
         Args:
-            image (torch.Tensor): 图像输入张量。
-            spatial (torch.Tensor): 空间坐标输入张量。
-            
+            image (torch.Tensor): Input image tensor.
+            spatial (torch.Tensor): Input spatial coordinate tensor.
+
         Returns:
-            tuple: 包含三个潜向量的元组:
-                - z_fused (torch.Tensor): 融合后的潜向量。
-                - z_img (torch.Tensor): 仅图像模态的潜向量。
-                - z_spatial (torch.Tensor): 仅空间模态的潜向量。
+            tuple: A tuple containing three latent vectors:
+                - z_fused (torch.Tensor): The fused latent vector.
+                - z_img (torch.Tensor): The image-only latent vector.
+                - z_spatial (torch.Tensor): The spatial-only latent vector.
         """
-        with torch.no_grad(): # 在推理模式下进行，不计算梯度
-            # 1. 编码过程（与 forward 函数相同）
-            # 图像编码
+        with torch.no_grad(): # Operate in inference mode, no gradient calculation
+            # 1. Encoding process (same as the forward pass)
+            # Image encoding
             img_x = self.image_encoder_swin(image).detach()
             mu_img = self.img_fc_mu(img_x)
             log_var_img = self.img_fc_log_var(img_x)
-            
-            # 空间编码
+
+            # Spatial encoding
             # spatial_fourier = self.fourier_mapper(spatial)
             spatial_x = self.spatial_encoder(spatial)
             mu_spatial = self.spatial_fc_mu(spatial_x)
             log_var_spatial = self.spatial_fc_log_var(spatial_x)
-            
-            # 2. 融合
+
+            # 2. Fusion
             mu_fused, log_var_fused = self.fuse_latents(mu_img, log_var_img, mu_spatial, log_var_spatial)
-            
-            # 3. 分别从三个分布中进行重参数化采样
+
+            # 3. Reparameterization sampling from the three distributions
             z_fused = self.reparameterize(mu_fused, log_var_fused)
             z_img = self.reparameterize(mu_img, log_var_img)
             z_spatial = self.reparameterize(mu_spatial, log_var_spatial)
-            
+
             return z_fused, z_img, z_spatial
-    
+
     def Dynomic_kld_weight(self, epoch, beta, kl_anneal_epochs=50):
         kld_weight = beta * min(1.0, epoch / kl_anneal_epochs) if kl_anneal_epochs > 0 else beta
         return kld_weight
-    
-# ======================================================================
-# --- 2. 混合损失函数 (已升级) ---
-# ======================================================================
-def multi_modal_vae_loss(recon_img, true_img, recon_rna_params, true_rna, 
+
+
+def multi_modal_vae_loss(recon_img, true_img, recon_rna_params, true_rna,
                          mu_fused, log_var_fused, z_img, z_spatial,
-                         kld_weight=1.0, image_weight=1.0, rna_weight=1.0, 
-                         alignment_weight=0.1): # *** NEW: 新增对齐权重 ***
-    # 图像重建损失 (MSE)
+                         kld_weight=1.0, image_weight=1.0, rna_weight=1.0,
+                         alignment_weight=0.1): # *** NEW: Add alignment weight ***
+    # Image reconstruction loss (MSE)
     image_recon_loss = F.mse_loss(recon_img, true_img, reduction='sum') / true_img.shape[0]
 
-    # RNA 重建损失 (NLL)
+    # RNA reconstruction loss (NLL)
     rna_recon_loss = scellst_nll_loss(recon_rna_params, true_rna)
-    
-    # KL 散度损失 (针对融合后的分布)
+
+    # KL divergence loss (for the fused distribution)
     kld_loss = -0.5 * torch.sum(1 + log_var_fused - mu_fused.pow(2) - log_var_fused.exp()) / true_img.shape[0]
-    
-    # *** NEW: 潜在空间对齐损失 (Alignment Loss) ***
+
+    # *** NEW: Latent space alignment loss ***
     alignment_loss = F.mse_loss(z_img, z_spatial, reduction='mean') # / true_img.shape[0]
-    
-    # 加权总损失
-    total_loss = (image_weight * image_recon_loss + 
-                  rna_weight * rna_recon_loss + 
+
+    # Weighted total loss
+    total_loss = (image_weight * image_recon_loss +
+                  rna_weight * rna_recon_loss +
                   kld_weight * kld_loss +
                   alignment_weight * alignment_loss) # *** NEW ***
-                  
+
     return total_loss, image_recon_loss, rna_recon_loss, kld_loss, alignment_loss # *** MODIFIED ***
 
-# ======================================================================
-# --- 3. 数据加载和评估指标 (保持不变) ---
-# ======================================================================
 import numpy as np
 import torch
 from scipy.sparse import issparse
@@ -380,16 +372,16 @@ from torch.utils.data import TensorDataset, DataLoader, Subset
 
 def prepare_adata_loader(adata_img, adata_rna, layer_key_img, shape_key_img, layer_key_rna, spatial_key, batch_size, ratio=(0.7, 0.1, 0.2), Train_shuffle=True):
     """
-    准备多模态数据加载器。
-    此版本使用 numpy.random.shuffle 来确保与另一个模型的数据划分方式完全一致。
+    Prepares multi-modal data loaders.
+    This version uses numpy.random.shuffle to ensure data splitting is exactly consistent with another model.
     """
-    print("--- 开始准备多模态数据 ---")
-    
-    # --- 数据预处理部分 (无需修改) ---
+    print("--- Starting to prepare multi-modal data ---")
+
+    # --- Data preprocessing part (no changes) ---
     if not np.isclose(np.sum(ratio), 1.0):
         raise ValueError(f"The sum of ratios must be 1, but got {np.sum(ratio)}")
-    
-    # ... (这部分数据准备代码和之前一样，这里省略以保持简洁) ...
+
+    # ... (This part of the data preparation code is the same as before, omitted for brevity) ...
     image_data_flat = adata_img.layers[layer_key_img]
     if issparse(image_data_flat): image_data_flat = image_data_flat.toarray()
     if isinstance(adata_img.obsm[shape_key_img], np.ndarray) and adata_img.obsm[shape_key_img].ndim == 2:
@@ -408,42 +400,41 @@ def prepare_adata_loader(adata_img, adata_rna, layer_key_img, shape_key_img, lay
     if issparse(rna_data): rna_data = rna_data.toarray()
     rna_tensor = torch.from_numpy(rna_data.astype(np.float32))
     rna_dim = rna_data.shape[1]
-    print(f"图像数据: {image_tensor.shape}, 空间数据: {spatial_tensor.shape}, RNA数据: {rna_tensor.shape}")
+    print(f"Image data: {image_tensor.shape}, Spatial data: {spatial_tensor.shape}, RNA data: {rna_tensor.shape}")
     dataset = TensorDataset(image_tensor, spatial_tensor, rna_tensor)
     n_samples = len(dataset)
-    
-    # --- 数据划分 (修改点在这里) ---
-    # 1. 计算各个集合的大小 (与目标模型逻辑保持一致)
+
+    # --- Data splitting (modification here) ---
+    # 1. Calculate the size of each set (consistent with the target model's logic)
     train_ratio, val_ratio, test_ratio = ratio
     train_size = int(train_ratio * n_samples)
     val_size = int(val_ratio * n_samples)
     test_size = n_samples - train_size - val_size
-    
-    # 2. 使用 NumPy 的方法进行随机索引划分 (与目标模型完全一致)
-    # --- 修改点开始 ---
+
+    # 2. Use NumPy's method for random index splitting (exactly consistent with the target model)
+    # --- start of modification ---
     indices = list(range(n_samples))
     np.random.seed(42)
     np.random.shuffle(indices)
-    
+
     train_indices = indices[:train_size]
     val_indices = indices[train_size : train_size + val_size]
     test_indices = indices[train_size + val_size:]
-    # --- 修改点结束 ---
-    
-    # 3. 使用切分好的索引创建 PyTorch Subset (无需修改)
+    # --- end of modification ---
+
+    # 3. Create PyTorch Subsets using the split indices (no changes)
     train_dataset = Subset(dataset, train_indices)
     val_dataset = Subset(dataset, val_indices)
     test_dataset = Subset(dataset, test_indices)
 
-    # --- 创建 DataLoader 部分 (无需修改) ---
+    # --- Create DataLoader part (no changes) ---
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=Train_shuffle) if len(train_dataset) > 0 else None
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) if len(val_dataset) > 0 else None
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False) if len(test_dataset) > 0 else None
-    
-    print(f"数据准备完成。训练集: {len(train_dataset)}, 验证集: {len(val_dataset)}, 测试集: {len(test_dataset)}")
-    
-    return train_loader, val_loader, test_loader, final_img_shape, rna_dim, spatial_dim,train_indices,val_dataset,test_indices
 
+    print(f"Data preparation complete. Training set: {len(train_dataset)}, Validation set: {len(val_dataset)}, Test set: {len(test_dataset)}")
+
+    return train_loader, val_loader, test_loader, final_img_shape, rna_dim, spatial_dim,train_indices,val_dataset,test_indices
 
 
 from sklearn.metrics import mean_squared_error
@@ -467,62 +458,60 @@ def calculate_spearman_correlation(pred_matrix, raw_matrix, axis=1):
         correlations.append(corr)
     return np.nanmedian(np.nan_to_num(np.array(correlations), nan=0.0))
 
-# ======================================================================
-# --- 4. 训练流程 (已升级) ---
-# ======================================================================
+
 def train_multi_modal_vae(model, train_loader, val_loader, epochs, learning_rate, device, **loss_weights):
-    print("\n--- 开始 Multi-Modal VAE 模型训练 (Swin Transformer版) ---")
+    print("\n--- Starting Multi-Modal VAE Model Training (Swin Transformer version) ---")
     model.to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate) # *** MODIFIED: 使用 AdamW ***
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate) # *** MODIFIED: Use AdamW ***
     best_val = 0.0
     best_model = model
-    beta = loss_weights.get('kld_weight', 1.0) 
+    beta = loss_weights.get('kld_weight', 1.0)
 
     for epoch in range(1, epochs + 1):
         model.train()
-        # *** MODIFIED: 增加 alignment_loss 的记录 ***
+        # *** MODIFIED: Add logging for alignment_loss ***
         total_loss, total_img_loss, total_rna_loss, total_kld_loss, total_align_loss = 0, 0, 0, 0, 0
-        
+
         current_loss_weights = loss_weights.copy()
         current_loss_weights['kld_weight'] = model.Dynomic_kld_weight(epoch, beta, kl_anneal_epochs=50)
 
         for (img_data, spatial_data, rna_data) in train_loader:
             img_data, spatial_data, rna_data = img_data.to(device), spatial_data.to(device), rna_data.to(device)
-            
-            # *** MODIFIED: 接收模型返回的所有潜在变量 ***
+
+            # *** MODIFIED: Receive all latent variables returned by the model ***
             recon_img, recon_rna_params, mu_fused, log_var_fused, z_img, z_spatial = model(img_data, spatial_data)
-            
-            # *** MODIFIED: 将所有变量传递给损失函数 ***
+
+            # *** MODIFIED: Pass all variables to the loss function ***
             loss, img_loss, rna_loss, kld_loss, align_loss = multi_modal_vae_loss(
-                recon_img, img_data, recon_rna_params, rna_data, 
+                recon_img, img_data, recon_rna_params, rna_data,
                 mu_fused, log_var_fused, z_img, z_spatial,
                 **current_loss_weights
             )
-            
+
             optimizer.zero_grad(); loss.backward(); optimizer.step()
-            
+
             total_loss += loss.item(); total_img_loss += img_loss.item()
             total_rna_loss += rna_loss.item(); total_kld_loss += kld_loss.item()
             total_align_loss += align_loss.item() # *** NEW ***
 
-        # --- 验证过程 ---
+        # --- Validation process ---
         model.eval()
         predicted_rna_list, true_rna_list = [], []
         with torch.no_grad():
             for (img_data, spatial_data, rna_data) in val_loader:
                 img_data, spatial_data, rna_data = img_data.to(device), spatial_data.to(device), rna_data.to(device)
-                # *** MODIFIED: 忽略不需要的返回值 ***
+                # *** MODIFIED: Ignore unneeded return values ***
                 _, recon_rna_params, _, _, _, _ = model(img_data, spatial_data)
                 predicted_mu = recon_rna_params['mu']
                 predicted_rna_list.append(predicted_mu.cpu().numpy())
                 true_rna_list.append(rna_data.cpu().numpy())
-        
+
         predicted_rna_matrix = np.vstack(predicted_rna_list)
         true_rna_matrix = np.vstack(true_rna_list)
         spearman_corr = calculate_spearman_correlation(predicted_rna_matrix, true_rna_matrix, axis=1)
         pearson_corr = calculate_median_pearson(predicted_rna_matrix, true_rna_matrix)
         mse = calculate_mse_col_normalized(predicted_rna_matrix, true_rna_matrix)
-        # *** MODIFIED: 更新打印信息 ***
+        # *** MODIFIED: Update print information ***
         print(f"Epoch: {epoch}/{epochs} | Loss: {total_loss/len(train_loader):.2f} "
               f"kld_w: {current_loss_weights['kld_weight']:.2f} "
               f"[Img: {total_img_loss/len(train_loader):.2f}, RNA: {total_rna_loss/len(train_loader):.2f}, "
@@ -531,5 +520,5 @@ def train_multi_modal_vae(model, train_loader, val_loader, epochs, learning_rate
         if best_val < pearson_corr:
             best_val = pearson_corr
             best_model = model
-    print("模型训练完成!")
+    print("Model training complete!")
     return best_model
