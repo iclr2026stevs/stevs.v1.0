@@ -1,4 +1,4 @@
-# stevs.v1.0
+# STevs.v1.0
 # STevs: Cross-Slice Spatial Transcriptomics Gene Expression Prediction
 
 STevs is a deep generative model designed to predict spatial gene expression from histology images. The core strength of this model lies in its powerful cross-slice generalization ability, enabling it to learn slice-invariant universal representations, which is particularly suitable for predicting gene expression in **3D continuous tissue sections**.
