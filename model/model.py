@@ -21,7 +21,7 @@ from scipy.stats import ConstantInputWarning
 # Ignore ConstantInputWarning
 warnings.filterwarnings("ignore", category=ConstantInputWarning)
 
-local_weights_path = './model.safetensors'
+local_weights_path = './pretrainmodel/model.safetensors'
 
 import torch
 from torch import nn
@@ -150,35 +150,36 @@ class MultiModalVAE(nn.Module):
         # 3. Load weights from local file and apply to the model
         # *** MODIFIED: Use safetensors.torch.load_file to load weights ***
         # *** MODIFIED: Use a more flexible way to load weights, to handle size mismatch issues ***
-        try:
-            print(f"Loading pretrained weights from local file: {local_weights_path}")
+        # try:
+        print(f"Loading pretrained weights from local file: {local_weights_path}")
 
-            # 1. Load pretrained weights
-            pretrained_dict = load_file(local_weights_path, device='cpu')
+        # 1. Load pretrained weights
+        pretrained_dict = load_file(local_weights_path, device='cpu')
 
-            # 2. Get the state dictionary of your current model
-            model_dict = self.image_encoder_swin.state_dict()
+        # 2. Get the state dictionary of your current model
+        model_dict = self.image_encoder_swin.state_dict()
 
-            # 3. Filter pretrained weights:
-            #    - Only keep layers that also exist in your current model (handles "Unexpected key" issues)
-            #    - Only keep layers with an exact shape match (handles "size mismatch" issues)
-            pretrained_dict_filtered = {
-                k: v for k, v in pretrained_dict.items()
-                if k in model_dict and model_dict[k].shape == v.shape
-            }
+        # 3. Filter pretrained weights:
+        #    - Only keep layers that also exist in your current model (handles "Unexpected key" issues)
+        #    - Only keep layers with an exact shape match (handles "size mismatch" issues)
+        pretrained_dict_filtered = {
+            k: v for k, v in pretrained_dict.items()
+            if k in model_dict and model_dict[k].shape == v.shape
+        }
 
-            # 4. Update your current model's state dictionary with the filtered weights
-            model_dict.update(pretrained_dict_filtered)
+        # 4. Update your current model's state dictionary with the filtered weights
+        model_dict.update(pretrained_dict_filtered)
 
-            # 5. Load the updated state dictionary back into the model
-            self.image_encoder_swin.load_state_dict(model_dict)
+        # 5. Load the updated state dictionary back into the model
+        self.image_encoder_swin.load_state_dict(model_dict)
 
-            loaded_keys = len(pretrained_dict_filtered)
-            total_keys = len(model_dict)
-            print(f"Local weights loaded successfully! Matched and loaded {loaded_keys} / {total_keys} weight layers.")
+        loaded_keys = len(pretrained_dict_filtered)
+        total_keys = len(model_dict)
+        print(f"Local weights loaded successfully!") # Matched and loaded {loaded_keys} / {total_keys} weight layers.
 
-        except FileNotFoundError:
-            print(f"Error: Pretrained weight file {local_weights_path} not found! Please ensure the file is uploaded to the correct location. The model will use randomly initialized weights.")
+        # except FileNotFoundError:
+            
+            # print(f"Error: Pretrained weight file {local_weights_path} not found! Please ensure the file is uploaded to the correct location. The model will use randomly initialized weights.")
         # Get the feature dimension of the Swin output
         swin_output_dim = self.image_encoder_swin.num_features
         self.img_fc_mu = nn.Linear(swin_output_dim, latent_dim)
@@ -296,6 +297,60 @@ class MultiModalVAE(nn.Module):
         return (reconstructed_image, reconstructed_rna_params,
                 mu_fused, log_var_fused,
                 z_img, z_spatial)
+    
+    def fast_forward(self, img_x, spatial):
+        """
+        Runs a forward pass using pre-extracted image features (img_x),
+        bypassing the Swin Transformer image encoder.
+        
+        Args:
+            img_x (torch.Tensor): Pre-extracted image features from the Swin encoder.
+            spatial (torch.Tensor): Input spatial coordinate tensor.
+            
+        Returns:
+            tuple: Same as the standard forward pass.
+        """
+        # 1. Encoding (starts from the feature-to-latent projection)
+        mu_img = self.img_fc_mu(img_x)
+        log_var_img = self.img_fc_log_var(img_x)
+        
+        # Spatial encoding (MLP)
+        spatial_x = self.spatial_encoder(spatial)
+        mu_spatial = self.spatial_fc_mu(spatial_x)
+        log_var_spatial = self.spatial_fc_log_var(spatial_x)
+
+        # 2. Fusing latent spaces (PoE)
+        mu_fused, log_var_fused = self.fuse_latents(mu_img, log_var_img, mu_spatial, log_var_spatial)
+
+        # 3. Reparameterization
+        z = self.reparameterize(mu_fused, log_var_fused)
+
+        # 4. Decoding
+        # Image decoding
+        img_recon_x = self.img_decoder_input(z)
+        img_recon_x = img_recon_x.view(-1, self.decoder_start_channels, self.decoder_start_size, self.decoder_start_size)
+        for stage in self.img_decoder_stages:
+            img_recon_x = stage(img_recon_x)
+        reconstructed_image = self.img_final_layer(img_recon_x)
+
+        # RNA decoding
+        if z.shape[0] > 1:
+            rna_base = self.rna_decoder_base(z)
+        else:
+            original_mode = self.rna_decoder_base.training
+            self.rna_decoder_base.eval()
+            with torch.no_grad():
+                rna_base = self.rna_decoder_base(z)
+            self.rna_decoder_base.train(original_mode)
+        
+        mu_rna = self.rna_decoder_mu(rna_base)
+        theta_rna = self.rna_decoder_theta(rna_base)
+        reconstructed_rna_params = {"mu": mu_rna, "theta": theta_rna}
+        z_img, z_spatial = self.reparameterize(mu_img, log_var_img), self.reparameterize(mu_spatial, log_var_spatial)
+        
+        return (reconstructed_image, reconstructed_rna_params,
+                mu_fused, log_var_fused,
+                z_img, z_spatial)
 
     def get_latent_representations(self, image, spatial):
         """
@@ -348,7 +403,10 @@ def multi_modal_vae_loss(recon_img, true_img, recon_rna_params, true_rna,
     image_recon_loss = F.mse_loss(recon_img, true_img, reduction='sum') / true_img.shape[0]
 
     # RNA reconstruction loss (NLL)
-    rna_recon_loss = scellst_nll_loss(recon_rna_params, true_rna)
+    if recon_rna_params is None or true_rna is None:
+        rna_recon_loss = 0
+    else:
+        rna_recon_loss = scellst_nll_loss(recon_rna_params, true_rna)
 
     # KL divergence loss (for the fused distribution)
     kld_loss = -0.5 * torch.sum(1 + log_var_fused - mu_fused.pow(2) - log_var_fused.exp()) / true_img.shape[0]
@@ -459,7 +517,12 @@ def calculate_spearman_correlation(pred_matrix, raw_matrix, axis=1):
     return np.nanmedian(np.nan_to_num(np.array(correlations), nan=0.0))
 
 
-def train_multi_modal_vae(model, train_loader, val_loader, epochs, learning_rate, device, **loss_weights):
+def train_multi_modal_vae(model, train_loader, val_loader, epochs, learning_rate, device, fast_train=True, mode='train', test_loader_list=None, **loss_weights):
+    '''
+        mode in ['train', 'algne']
+    '''
+    if fast_train:
+        return fast_train_multi_modal_vae(model, train_loader, val_loader, epochs, learning_rate, device, **loss_weights)
     print("\n--- Starting Multi-Modal VAE Model Training (Swin Transformer version) ---")
     model.to(device)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate) # *** MODIFIED: Use AdamW ***
@@ -493,6 +556,34 @@ def train_multi_modal_vae(model, train_loader, val_loader, epochs, learning_rate
             total_loss += loss.item(); total_img_loss += img_loss.item()
             total_rna_loss += rna_loss.item(); total_kld_loss += kld_loss.item()
             total_align_loss += align_loss.item() # *** NEW ***
+        if mode == 'algne':
+            for (img_data, spatial_data, rna_data) in val_loader:
+                rna_data = None
+                img_data, spatial_data = img_data.to(device), spatial_data.to(device)
+                # *** MODIFIED: Receive all latent variables returned by the model ***
+                recon_img, recon_rna_params, mu_fused, log_var_fused, z_img, z_spatial = model(img_data, spatial_data)
+
+                # *** MODIFIED: Pass all variables to the loss function ***
+                loss, img_loss, rna_loss, kld_loss, align_loss = multi_modal_vae_loss(
+                    recon_img, img_data, None, None,
+                    mu_fused, log_var_fused, z_img, z_spatial,
+                    **current_loss_weights
+                )
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+            for test_loader in test_loader_list:
+                for (img_data, spatial_data, rna_data) in test_loader:
+                    rna_data = None
+                    img_data, spatial_data = img_data.to(device), spatial_data.to(device)
+                    # *** MODIFIED: Receive all latent variables returned by the model ***
+                    recon_img, recon_rna_params, mu_fused, log_var_fused, z_img, z_spatial = model(img_data, spatial_data)
+
+                    # *** MODIFIED: Pass all variables to the loss function ***
+                    loss, img_loss, rna_loss, kld_loss, align_loss = multi_modal_vae_loss(
+                        recon_img, img_data, None, None,
+                        mu_fused, log_var_fused, z_img, z_spatial,
+                        **current_loss_weights
+                    )
+                    optimizer.zero_grad(); loss.backward(); optimizer.step()
 
         # --- Validation process ---
         model.eval()
@@ -522,3 +613,94 @@ def train_multi_modal_vae(model, train_loader, val_loader, epochs, learning_rate
             best_model = model
     print("Model training complete!")
     return best_model
+
+
+def fast_train_multi_modal_vae(model, train_loader, val_loader, epochs, learning_rate, device, **loss_weights):
+    """
+    Trains the Multi-Modal VAE using pre-extracted image features for faster training.
+    Removes the evaluation portion and only shows epoch progress.
+    
+    Args:
+        model (MultiModalVAE): The VAE model to train.
+        train_loader (DataLoader): DataLoader for the training data.
+        val_loader (DataLoader): DataLoader for the validation data (unused in this function).
+        epochs (int): Number of training epochs.
+        learning_rate (float): Learning rate for the optimizer.
+        device (torch.device): The device (CPU or GPU) to train on.
+        **loss_weights: Dictionary of weights for different loss components.
+        
+    Returns:
+        torch.nn.Module: The trained model from the last epoch.
+    """
+    print("\n--- Starting Fast Multi-Modal VAE Training (using pre-extracted features) ---")
+    model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+    beta = loss_weights.get('kld_weight', 1.0)
+    
+    # 1. Pre-compute image features and collect all data in a single pass
+    print("Pre-computing all image features and collecting all data from the training set...")
+    precomputed_data = []
+    with torch.no_grad():
+        for (img_data, spatial_data, rna_data) in train_loader:
+            img_data_device = img_data.to(device)
+            # Use the image encoder to get features
+            img_x = model.image_encoder_swin(img_data_device).detach().cpu()
+            # Append a tuple containing the pre-extracted features AND the original data
+            precomputed_data.append((img_x, spatial_data, rna_data, img_data))
+
+    # 2. Create a new DataLoader from the pre-computed data
+    # Unpack the list of tuples into separate lists of tensors
+    img_x_all = torch.cat([x[0] for x in precomputed_data], dim=0)
+    spatial_data_all = torch.cat([x[1] for x in precomputed_data], dim=0)
+    rna_data_all = torch.cat([x[2] for x in precomputed_data], dim=0)
+    img_data_all = torch.cat([x[3] for x in precomputed_data], dim=0) # New: Original image data
+
+    fast_dataset = TensorDataset(img_x_all, spatial_data_all, rna_data_all, img_data_all)
+    fast_train_loader = DataLoader(fast_dataset, batch_size=train_loader.batch_size, shuffle=True)
+    
+    print(f"Pre-computation complete. Starting training loop over {len(fast_dataset)} samples...")
+
+    # 3. Training Loop (no evaluation part)
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss, total_img_loss, total_rna_loss, total_kld_loss, total_align_loss = 0, 0, 0, 0, 0
+        
+        current_loss_weights = loss_weights.copy()
+        current_loss_weights['kld_weight'] = model.Dynomic_kld_weight(epoch, beta, kl_anneal_epochs=50)
+        
+        # Iterate over the new fast_train_loader
+        for (img_x_precomputed, spatial_data, rna_data, true_img) in fast_train_loader:
+            img_x_precomputed, spatial_data, rna_data, true_img = (
+                img_x_precomputed.to(device), spatial_data.to(device), rna_data.to(device), true_img.to(device)
+            )
+
+            # Use the new fast_forward method
+            recon_img, recon_rna_params, mu_fused, log_var_fused, z_img, z_spatial = model.fast_forward(
+                img_x_precomputed, spatial_data
+            )
+            
+            # Now, true_img contains the correct ground-truth image data for loss calculation
+            loss, img_loss, rna_loss, kld_loss, align_loss = multi_modal_vae_loss(
+                recon_img, true_img, recon_rna_params, rna_data,
+                mu_fused, log_var_fused, z_img, z_spatial,
+                **current_loss_weights
+            )
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            total_img_loss += img_loss.item()
+            total_rna_loss += rna_loss.item()
+            total_kld_loss += kld_loss.item()
+            total_align_loss += align_loss.item()
+        
+        # Simple progress update
+        print(f"Epoch: {epoch}/{epochs} | Loss: {total_loss/len(fast_train_loader):.2f} "
+              f"kld_w: {current_loss_weights['kld_weight']:.2f} "
+              f"[Img: {total_img_loss/len(fast_train_loader):.2f}, RNA: {total_rna_loss/len(fast_train_loader):.2f}, "
+              f"KLD: {total_kld_loss/len(fast_train_loader):.2f}, Align: {total_align_loss/len(fast_train_loader):.4f}]")
+
+    print("Fast training complete!")
+    return model
